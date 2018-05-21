@@ -1,0 +1,192 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+
+version = '2.0 2018/02/23'
+
+# ユニコードファイル名を扱うには argparse 側? にちょっと問題があるようなので
+# UTF-8 ロケール以外を想定せず，文字列は str (x unicode) 型で処理する
+
+import os, sys, argparse
+
+#
+debug = False
+
+# コマンドライン引数
+parser = argparse.ArgumentParser(description = 'Re-render PDF for the optimization using ghostscript')
+parser.add_argument('--gs-prog', help='ghostscriptのパスを指定する')
+parser.add_argument('--enable-jpeg', help='画像のJPEG圧縮を行う', action='store_true')
+parser.add_argument('--preserve-bookmark', help='PDF文書のブックマークを保持する', action='store_true')
+parser.add_argument('--no-downsample', help='画像のリサンプル処理を無効にする', action='store_true')
+parser.add_argument('--pdfx3', help='PDFx3形式に保存する', action='store_true')
+parser.add_argument('--outline-fonts', help='フォントのアウトライン化を行う', action='store_true')
+parser.add_argument('-o', '--output', help='出力PDFファイル名を指定する (1番目のPDFのみ有効)')
+# ghostscript のオプションを指定
+# ハイフンで始まるオプションは = で繋いだロングオプションでないとエラーになるので注意
+#  例: optimize-pdf --gs-option=-sPDFPassword=password input.pdf
+parser.add_argument('--gs-option', help='ghostscript に追加のオプションを追加する', action='append')
+parser.add_argument('-v', '--verbose', action='store_true')
+parser.add_argument('input_files', nargs='*')
+# (隠しオプション，bash_completion のエントリを出力)
+parser.add_argument('--export-completion', help=argparse.SUPPRESS, action='store_true')
+
+args = parser.parse_args()
+
+# bash-completion 用のエントリを作成 (最優先で処理)
+if args.export_completion:
+    print """\
+# bash-completion code for script "optimize-pdf"
+_optimize-pdf() {
+    local cur prev words cword
+    _init_completion || return
+
+    case $prev in
+	--output | -o )
+	    _filedir
+	    return
+	    ;;
+    esac
+    
+    if [[ "$cur" == -* ]]; then
+        COMPREPLY=( $( compgen -W '$( _parse_help "$1" --help ) -h -o -v' -- "$cur" ) )
+    else
+	_filedir '@([pP][dD][fF])'
+    fi
+
+} && complete -F _optimize-pdf optimize-pdf"""
+    sys.exit(0)
+
+# メインの処理部分
+import subprocess, tempfile, shutil
+
+# do_optimize_pdf('入力ファイルパス.pdf', '出力ファイルパス.pdf')
+def do_optimize_pdf(infile, outfile):
+    gs = 'rungs'
+    if args.gs_prog:
+        gs = args.gs_prog
+    
+    # gs のコマンドラインは日本語や空白ファイル名を処理できないので
+    # ascii 文字のみの一時ファイルで変換を行って変換後のファイルをコピーする
+    # 入出力 PDF ファイル名は input.pdf, output.pdf で固定
+    # パスセパレータ等で面倒が起きないように一時ディレクトリを作業ディレクトリにする
+    
+    # -c オプションの仕様につき，OutputFile は先に指定しないといけない
+    gs_command = [ gs, '-dNOPAUSE', '-dBATCH', '-P-', '-dSAFER', '-sDEVICE=pdfwrite', '-dPDFSETTINGS=/prepress', '-sOutputFile=output.pdf' ]
+    
+    # JPEG 圧縮を禁止する処理
+    if not args.enable_jpeg:
+        gs_command += ['-dAutoFilterGrayImages=false', '-dAutoFilterColorImages=false',
+                       '-dGrayImageFilter=/Fla{*filter*}code', '-dColorImageFilter=/Fla{*filter*}code' ]
+
+    # PDF を開いたときにブックマークを開く処理
+    if args.preserve_bookmark:
+        gs_command += [ '-c', '[ /PageMode /UseOutlines /Page 1 /DOCVIEW pdfmark' ]
+    
+    # リサンプル処理を禁止 (実際にはリサンプルの条件をかなり厳しくする)
+    if args.no_downsample:
+        gs_command += [ '-dColorImageDownsampleThreshold=10.0', '-dGrayImageDownsampleThreshold=10.0' ]
+    
+    # PDF/X-3 形式で出力する
+    if args.pdfx3:
+        gs_command += [ '-dPDFX' ]
+
+    # フォントのアウトライン化を行う
+    if args.outline_fonts:
+        gs_command += [ '-dNoOutputFonts' ]
+
+    # サポートしていない追加のオプションを追加する
+    if args.gs_option:
+        for a in args.gs_option:
+            gs_command += [ a ]
+    
+    gs_command += [ '-f', 'input.pdf' ]
+    
+    temp_dir = tempfile.mkdtemp()
+    temp_infile = os.path.join(temp_dir, 'input.pdf')
+    temp_outfile = os.path.join(temp_dir, 'output.pdf')
+    
+    if debug:
+        print 'gs_command:', gs_command
+        print 'temp_dir:', temp_dir
+        print 'temp_infile', temp_infile
+        print 'temp_outfile', temp_outfile
+    
+    cwd = os.getcwd()
+    
+    try:
+        shutil.copy(infile, temp_infile)
+        if debug:
+            print 'Copying: ', infile, '->', temp_infile
+        
+        os.chdir(temp_dir)
+        retcode = subprocess.call(gs_command)
+        os.chdir(cwd)
+        
+        if retcode != 0 or not os.path.exists(temp_outfile):
+            raise RuntimeError('Output PDF is not generated')
+        
+        shutil.copy(temp_outfile, outfile)
+        if debug:
+            print 'Copying: ', temp_outfile, '->', outfile
+
+    except RuntimeError as ex:
+        raise ex
+    
+    finally:
+        os.chdir(cwd)
+        shutil.rmtree(temp_dir)
+    
+#
+input_files = []
+output_files = []
+
+# 引数のチェック
+
+
+if debug:
+    print 'args:', args
+
+def to_output_filename(input_filename):
+    root, ext = os.path.splitext(input_filename)
+    return root + '-opt' + ext
+
+if not args.input_files:
+    if debug:
+        args.input_files = [ 'src.pdf' ]
+    else:
+        raise RuntimeError('Input file is not specified')
+
+for f in args.input_files:
+    if not os.path.exists(f):
+        raise RuntimeError('Input file "{0}" does not exist'.format(f))
+
+input_files += args.input_files
+    
+if args.output:
+    output_files += [ args.output ]
+else:
+    output_files += [ to_output_filename(input_files[0]) ]
+
+output_files += [ to_output_filename(f) for f in input_files[1:] ]
+
+# ↑ でデバッグ用の src.pdf を設定した後にオプション verbose を処理
+if args.verbose:
+    debug = True
+
+#
+
+if debug:
+    print 'input_files:', input_files
+    print 'output_files:', output_files
+
+assert len(input_files) == len(output_files)
+
+profile = []
+
+for infile, outfile in zip(input_files, output_files):
+    do_optimize_pdf(infile, outfile)
+    size_input = os.path.getsize(infile)
+    size_output = os.path.getsize(outfile)
+    profile.append( '{0} ({1}) --> {2} ({3})'.format(infile, size_input, outfile, size_output) )
+
+print '\n'.join(profile)
+
